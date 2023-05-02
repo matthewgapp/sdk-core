@@ -565,7 +565,7 @@ async fn slow_completes_with_small_cache() {
             ctx.activity(ActivityOptions {
                 activity_type: "echo_activity".to_string(),
                 start_to_close_timeout: Some(Duration::from_secs(5)),
-                input: "hi!".as_json_payload().expect("serializes fine"),
+                input: vec!["hi!".as_json_payload().expect("serializes fine")],
                 ..Default::default()
             })
             .await;
@@ -573,7 +573,7 @@ async fn slow_completes_with_small_cache() {
         }
         Ok(().into())
     });
-    worker.register_activity("echo_activity", echo);
+    worker.register_activity("echo_activity", ActivityFunction::new(echo));
     for i in 0..20 {
         worker
             .submit_wf(

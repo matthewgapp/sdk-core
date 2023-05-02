@@ -7,8 +7,8 @@ use std::{
 };
 use temporal_client::WorkflowOptions;
 use temporal_sdk::{
-    interceptors::WorkerInterceptor, ActContext, ActivityCancelledError, CancellableFuture,
-    LocalActivityOptions, WfContext, WorkflowResult,
+    interceptors::WorkerInterceptor, ActContext, ActivityCancelledError, ActivityFunction,
+    CancellableFuture, LocalActivityOptions, WfContext, WorkflowResult,
 };
 use temporal_sdk_core::replay::HistoryForReplay;
 use temporal_sdk_core_protos::{
@@ -30,7 +30,7 @@ pub async fn one_local_activity_wf(ctx: WfContext) -> WorkflowResult<()> {
     let initial_workflow_time = ctx.workflow_time().expect("Workflow time should be set");
     ctx.local_activity(LocalActivityOptions {
         activity_type: "echo_activity".to_string(),
-        input: "hi!".as_json_payload().expect("serializes fine"),
+        input: vec!["hi!".as_json_payload().expect("serializes fine")],
         ..Default::default()
     })
     .await;
@@ -45,7 +45,7 @@ async fn one_local_activity() {
     let mut starter = CoreWfStarter::new(wf_name);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), one_local_activity_wf);
-    worker.register_activity("echo_activity", echo);
+    worker.register_activity("echo_activity", ActivityFunction::new(echo));
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -54,7 +54,7 @@ async fn one_local_activity() {
 pub async fn local_act_concurrent_with_timer_wf(ctx: WfContext) -> WorkflowResult<()> {
     let la = ctx.local_activity(LocalActivityOptions {
         activity_type: "echo_activity".to_string(),
-        input: "hi!".as_json_payload().expect("serializes fine"),
+        input: vec!["hi!".as_json_payload().expect("serializes fine")],
         ..Default::default()
     });
     let timer = ctx.timer(Duration::from_secs(1));
@@ -68,7 +68,7 @@ async fn local_act_concurrent_with_timer() {
     let mut starter = CoreWfStarter::new(wf_name);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_concurrent_with_timer_wf);
-    worker.register_activity("echo_activity", echo);
+    worker.register_activity("echo_activity", ActivityFunction::new(echo));
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -77,7 +77,7 @@ async fn local_act_concurrent_with_timer() {
 pub async fn local_act_then_timer_then_wait(ctx: WfContext) -> WorkflowResult<()> {
     let la = ctx.local_activity(LocalActivityOptions {
         activity_type: "echo_activity".to_string(),
-        input: "hi!".as_json_payload().expect("serializes fine"),
+        input: vec!["hi!".as_json_payload().expect("serializes fine")],
         ..Default::default()
     });
     ctx.timer(Duration::from_secs(1)).await;
@@ -92,7 +92,7 @@ async fn local_act_then_timer_then_wait_result() {
     let mut starter = CoreWfStarter::new(wf_name);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_then_timer_then_wait);
-    worker.register_activity("echo_activity", echo);
+    worker.register_activity("echo_activity", ActivityFunction::new(echo));
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -105,10 +105,13 @@ async fn long_running_local_act_with_timer() {
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_then_timer_then_wait);
-    worker.register_activity("echo_activity", |_ctx: ActContext, str: String| async {
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        Ok(str)
-    });
+    worker.register_activity(
+        "echo_activity",
+        ActivityFunction::new(|_ctx: ActContext, str: String| async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(str)
+        }),
+    );
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -119,9 +122,9 @@ pub async fn local_act_fanout_wf(ctx: WfContext) -> WorkflowResult<()> {
         .map(|i| {
             ctx.local_activity(LocalActivityOptions {
                 activity_type: "echo_activity".to_string(),
-                input: format!("Hi {i}")
+                input: vec![format!("Hi {i}")
                     .as_json_payload()
-                    .expect("serializes fine"),
+                    .expect("serializes fine")],
                 ..Default::default()
             })
         })
@@ -138,7 +141,7 @@ async fn local_act_fanout() {
     starter.max_local_at(1);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_fanout_wf);
-    worker.register_activity("echo_activity", echo);
+    worker.register_activity("echo_activity", ActivityFunction::new(echo));
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -153,7 +156,7 @@ async fn local_act_retry_timer_backoff() {
         let res = ctx
             .local_activity(LocalActivityOptions {
                 activity_type: "echo".to_string(),
-                input: "hi".as_json_payload().expect("serializes fine"),
+                input: vec!["hi".as_json_payload().expect("serializes fine")],
                 retry_policy: RetryPolicy {
                     initial_interval: Some(prost_dur!(from_micros(15))),
                     // We want two local backoffs that are short. Third backoff will use timer
@@ -169,9 +172,12 @@ async fn local_act_retry_timer_backoff() {
         assert!(res.failed());
         Ok(().into())
     });
-    worker.register_activity("echo", |_: ActContext, _: String| async {
-        Result::<(), _>::Err(anyhow!("Oh no I failed!"))
-    });
+    worker.register_activity(
+        "echo",
+        ActivityFunction::new(|_: ActContext, _: String| async {
+            Result::<(), _>::Err(anyhow!("Oh no I failed!"))
+        }),
+    );
 
     let run_id = worker
         .submit_wf(
@@ -201,7 +207,7 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
     worker.register_wf(&wf_name, move |ctx: WfContext| async move {
         let la = ctx.local_activity(LocalActivityOptions {
             activity_type: "echo".to_string(),
-            input: "hi".as_json_payload().expect("serializes fine"),
+            input: vec!["hi".as_json_payload().expect("serializes fine")],
             cancel_type,
             ..Default::default()
         });
@@ -215,19 +221,22 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
     let manual_cancel = CancellationToken::new();
     let manual_cancel_act = manual_cancel.clone();
 
-    worker.register_activity("echo", move |ctx: ActContext, _: String| {
-        let manual_cancel_act = manual_cancel_act.clone();
-        async move {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {},
-                _ = ctx.cancelled() => {
-                    return Err(anyhow!(ActivityCancelledError::default()))
+    worker.register_activity(
+        "echo",
+        ActivityFunction::new(move |ctx: ActContext, _: String| {
+            let manual_cancel_act = manual_cancel_act.clone();
+            async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                    _ = ctx.cancelled() => {
+                        return Err(anyhow!(ActivityCancelledError::default()))
+                    }
+                    _ = manual_cancel_act.cancelled() => {}
                 }
-                _ = manual_cancel_act.cancelled() => {}
+                Ok(())
             }
-            Ok(())
-        }
-    });
+        }),
+    );
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker
@@ -289,7 +298,7 @@ async fn cancel_after_act_starts(
     worker.register_wf(&wf_name, move |ctx: WfContext| async move {
         let la = ctx.local_activity(LocalActivityOptions {
             activity_type: "echo".to_string(),
-            input: "hi".as_json_payload().expect("serializes fine"),
+            input: vec!["hi".as_json_payload().expect("serializes fine")],
             retry_policy: RetryPolicy {
                 initial_interval: Some(bo_dur.try_into().unwrap()),
                 backoff_coefficient: 1.,
@@ -319,29 +328,32 @@ async fn cancel_after_act_starts(
     let manual_cancel = CancellationToken::new();
     let manual_cancel_act = manual_cancel.clone();
 
-    worker.register_activity("echo", move |ctx: ActContext, _: String| {
-        let manual_cancel_act = manual_cancel_act.clone();
-        async move {
-            if cancel_on_backoff.is_some() {
-                if ctx.is_cancelled() {
-                    return Err(anyhow!(ActivityCancelledError::default()));
-                }
-                // Just fail constantly so we get stuck on the backoff timer
-                return Err(anyhow!("Oh no I failed!"));
-            } else {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(100)) => {},
-                    _ = ctx.cancelled() => {
-                        return Err(anyhow!(ActivityCancelledError::default()))
+    worker.register_activity(
+        "echo",
+        ActivityFunction::new(move |ctx: ActContext, _: String| {
+            let manual_cancel_act = manual_cancel_act.clone();
+            async move {
+                if cancel_on_backoff.is_some() {
+                    if ctx.is_cancelled() {
+                        return Err(anyhow!(ActivityCancelledError::default()));
                     }
-                    _ = manual_cancel_act.cancelled() => {
-                        return Ok(())
+                    // Just fail constantly so we get stuck on the backoff timer
+                    return Err(anyhow!("Oh no I failed!"));
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(100)) => {},
+                        _ = ctx.cancelled() => {
+                            return Err(anyhow!(ActivityCancelledError::default()))
+                        }
+                        _ = manual_cancel_act.cancelled() => {
+                            return Ok(())
+                        }
                     }
                 }
+                Err(anyhow!("Oh no I failed!"))
             }
-            Err(anyhow!("Oh no I failed!"))
-        }
-    });
+        }),
+    );
 
     starter.start_with_worker(&wf_name, &mut worker).await;
     worker
@@ -382,7 +394,7 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
         let res = ctx
             .local_activity(LocalActivityOptions {
                 activity_type: "echo".to_string(),
-                input: "hi".as_json_payload().expect("serializes fine"),
+                input: vec!["hi".as_json_payload().expect("serializes fine")],
                 retry_policy: RetryPolicy {
                     initial_interval: Some(prost_dur!(from_micros(15))),
                     backoff_coefficient: 1_000.,
@@ -399,15 +411,18 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
         assert_eq!(res.timed_out(), Some(timeout_type));
         Ok(().into())
     });
-    worker.register_activity("echo", |ctx: ActContext, _: String| async move {
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(100)) => {},
-            _ = ctx.cancelled() => {
-                return Err(anyhow!(ActivityCancelledError::default()))
-            }
-        };
-        Ok(())
-    });
+    worker.register_activity(
+        "echo",
+        ActivityFunction::new(|ctx: ActContext, _: String| async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(100)) => {},
+                _ = ctx.cancelled() => {
+                    return Err(anyhow!(ActivityCancelledError::default()))
+                }
+            };
+            Ok(())
+        }),
+    );
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -431,7 +446,7 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         let res = ctx
             .local_activity(LocalActivityOptions {
                 activity_type: "echo".to_string(),
-                input: "hi".as_json_payload().expect("serializes fine"),
+                input: vec!["hi".as_json_payload().expect("serializes fine")],
                 retry_policy: RetryPolicy {
                     initial_interval: Some(prost_dur!(from_millis(15))),
                     backoff_coefficient: 1_000.,
@@ -448,10 +463,13 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         Ok(().into())
     });
     let num_attempts: &'static _ = Box::leak(Box::new(AtomicU8::new(0)));
-    worker.register_activity("echo", move |_: ActContext, _: String| async {
-        num_attempts.fetch_add(1, Ordering::Relaxed);
-        Result::<(), _>::Err(anyhow!("Oh no I failed!"))
-    });
+    worker.register_activity(
+        "echo",
+        ActivityFunction::new(move |_: ActContext, _: String| async {
+            num_attempts.fetch_add(1, Ordering::Relaxed);
+            Result::<(), _>::Err(anyhow!("Oh no I failed!"))
+        }),
+    );
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -468,10 +486,13 @@ async fn eviction_wont_make_local_act_get_dropped(#[values(true, false)] short_w
     starter.max_cached_workflows(0);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_then_timer_then_wait);
-    worker.register_activity("echo_activity", |_ctx: ActContext, str: String| async {
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        Ok(str)
-    });
+    worker.register_activity(
+        "echo_activity",
+        ActivityFunction::new(|_ctx: ActContext, str: String| async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(str)
+        }),
+    );
 
     let opts = if short_wft_timeout {
         WorkflowOptions {
@@ -496,7 +517,7 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
     worker.register_wf(wf_name.to_owned(), |ctx: WfContext| async move {
         let r1 = ctx.local_activity(LocalActivityOptions {
             activity_type: "echo".to_string(),
-            input: "hi".as_json_payload().expect("serializes fine"),
+            input: vec!["hi".as_json_payload().expect("serializes fine")],
             retry_policy: RetryPolicy {
                 initial_interval: Some(prost_dur!(from_micros(15))),
                 backoff_coefficient: 1_000.,
@@ -509,7 +530,7 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
         });
         let r2 = ctx.local_activity(LocalActivityOptions {
             activity_type: "echo".to_string(),
-            input: "hi".as_json_payload().expect("serializes fine"),
+            input: vec!["hi".as_json_payload().expect("serializes fine")],
             retry_policy: RetryPolicy {
                 initial_interval: Some(prost_dur!(from_millis(15))),
                 backoff_coefficient: 10.,
@@ -525,9 +546,12 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
         assert!(r2.failed());
         Ok(().into())
     });
-    worker.register_activity("echo", |_: ActContext, _: String| async {
-        Result::<(), _>::Err(anyhow!("Oh no I failed!"))
-    });
+    worker.register_activity(
+        "echo",
+        ActivityFunction::new(|_: ActContext, _: String| async {
+            Result::<(), _>::Err(anyhow!("Oh no I failed!"))
+        }),
+    );
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -543,7 +567,7 @@ async fn repro_nondeterminism_with_timer_bug() {
         let t1 = ctx.timer(Duration::from_secs(30));
         let r1 = ctx.local_activity(LocalActivityOptions {
             activity_type: "delay".to_string(),
-            input: "hi".as_json_payload().expect("serializes fine"),
+            input: vec!["hi".as_json_payload().expect("serializes fine")],
             retry_policy: RetryPolicy {
                 initial_interval: Some(prost_dur!(from_micros(15))),
                 backoff_coefficient: 1_000.,
@@ -564,10 +588,13 @@ async fn repro_nondeterminism_with_timer_bug() {
         ctx.timer(Duration::from_secs(1)).await;
         Ok(().into())
     });
-    worker.register_activity("delay", |_: ActContext, _: String| async {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        Ok(())
-    });
+    worker.register_activity(
+        "delay",
+        ActivityFunction::new(|_: ActContext, _: String| async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        }),
+    );
 
     let run_id = worker
         .submit_wf(
@@ -607,10 +634,13 @@ async fn weird_la_nondeterminism_repro(#[values(true, false)] fix_hist: bool) {
         "evict_while_la_running_no_interference",
         la_problem_workflow,
     );
-    worker.register_activity("delay", |_: ActContext, _: String| async {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        Ok(())
-    });
+    worker.register_activity(
+        "delay",
+        ActivityFunction::new(|_: ActContext, _: String| async {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(())
+        }),
+    );
     worker.run().await.unwrap();
 }
 
@@ -632,10 +662,13 @@ async fn second_weird_la_nondeterminism_repro() {
         "evict_while_la_running_no_interference",
         la_problem_workflow,
     );
-    worker.register_activity("delay", |_: ActContext, _: String| async {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        Ok(())
-    });
+    worker.register_activity(
+        "delay",
+        ActivityFunction::new(|_: ActContext, _: String| async {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(())
+        }),
+    );
     worker.run().await.unwrap();
 }
 
@@ -655,9 +688,12 @@ async fn third_weird_la_nondeterminism_repro() {
         "evict_while_la_running_no_interference",
         la_problem_workflow,
     );
-    worker.register_activity("delay", |_: ActContext, _: String| async {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        Ok(())
-    });
+    worker.register_activity(
+        "delay",
+        ActivityFunction::new(|_: ActContext, _: String| async {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(())
+        }),
+    );
     worker.run().await.unwrap();
 }
