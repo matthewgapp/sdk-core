@@ -28,7 +28,9 @@ use std::{
     time::Duration,
 };
 use temporal_client::{WorkflowClientTrait, WorkflowOptions};
-use temporal_sdk::{interceptors::WorkerInterceptor, ActivityOptions, WfContext, WorkflowResult};
+use temporal_sdk::{
+    interceptors::WorkerInterceptor, ActivityFunction, ActivityOptions, WfContext, WorkflowResult,
+};
 use temporal_sdk_core::{replay::HistoryForReplay, CoreRuntime};
 use temporal_sdk_core_api::{
     errors::{PollWfError, WorkflowErrorType},
@@ -42,7 +44,7 @@ use temporal_sdk_core_protos::{
             ActivityCancellationType, FailWorkflowExecution, QueryResult, QuerySuccess, StartTimer,
         },
         workflow_completion::WorkflowActivationCompletion,
-        ActivityTaskCompletion, AsJsonPayloadExt, IntoCompletion,
+        ActivityTaskCompletion, AsPayloadExt, IntoCompletion,
     },
     temporal::api::{
         enums::v1::EventType, failure::v1::Failure, history::v1::history_event,
