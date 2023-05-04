@@ -21,8 +21,8 @@ use std::{
 };
 use temporal_client::WorkflowOptions;
 use temporal_sdk::{
-    ActContext, ActivityCancelledError, LocalActivityOptions, WfContext, WorkflowFunction,
-    WorkflowResult,
+    ActContext, ActExitValue, ActivityCancelledError, ActivityFunction, LocalActivityOptions,
+    WfContext, WorkflowFunction, WorkflowResult,
 };
 use temporal_sdk_core_api::{
     errors::{PollActivityError, PollWfError},
@@ -99,7 +99,7 @@ async fn local_act_two_wfts_before_marker(#[case] replay: bool, #[case] cached: 
             Ok(().into())
         },
     );
-    worker.register_activity(DEFAULT_ACTIVITY_TYPE, echo);
+    worker.register_activity(DEFAULT_ACTIVITY_TYPE, ActivityFunction::from(echo));
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -149,7 +149,7 @@ async fn local_act_many_concurrent() {
     let mut worker = mock_sdk(mh);
 
     worker.register_wf(DEFAULT_WORKFLOW_TYPE.to_owned(), local_act_fanout_wf);
-    worker.register_activity("echo", echo);
+    worker.register_activity("echo", ActivityFunction::from(echo));
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -205,14 +205,17 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
             Ok(().into())
         },
     );
-    worker.register_activity("echo", move |_ctx: ActContext, str: String| async move {
-        if shutdown_middle {
-            shutdown_barr.wait().await;
-        }
-        // Take slightly more than two workflow tasks
-        tokio::time::sleep(wft_timeout.mul_f32(2.2)).await;
-        Ok(str)
-    });
+    worker.register_activity(
+        "echo",
+        ActivityFunction::from(move |_ctx: ActContext, str: String| async move {
+            if shutdown_middle {
+                shutdown_barr.wait().await;
+            }
+            // Take slightly more than two workflow tasks
+            tokio::time::sleep(wft_timeout.mul_f32(2.2)).await;
+            Ok(str)
+        }),
+    );
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -274,10 +277,10 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
         },
     );
     let attempts: &'static _ = Box::leak(Box::new(AtomicUsize::new(0)));
-    worker.register_activity("echo", move |_ctx: ActContext, _: String| async move {
+    worker.register_activity("echo", move |_ctx: ActContext| async move {
         // Succeed on 3rd attempt (which is ==2 since fetch_add returns prev val)
         if 2 == attempts.fetch_add(1, Ordering::Relaxed) && eventually_pass {
-            Ok(())
+            Ok(().into())
         } else {
             Err(anyhow!("Oh no I failed!"))
         }
@@ -353,12 +356,9 @@ async fn local_act_retry_long_backoff_uses_timer() {
             Ok(().into())
         },
     );
-    worker.register_activity(
-        DEFAULT_ACTIVITY_TYPE,
-        move |_ctx: ActContext, _: String| async move {
-            Result::<(), _>::Err(anyhow!("Oh no I failed!"))
-        },
-    );
+    worker.register_activity(DEFAULT_ACTIVITY_TYPE, move |_ctx: ActContext| async move {
+        Result::<ActExitValue<()>, _>::Err(anyhow!("Oh no I failed!"))
+    });
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -396,7 +396,7 @@ async fn local_act_null_result() {
             Ok(().into())
         },
     );
-    worker.register_activity("nullres", |_ctx: ActContext, _: String| async { Ok(()) });
+    worker.register_activity("nullres", |_ctx: ActContext| async { Ok(().into()) });
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -440,7 +440,7 @@ async fn local_act_command_immediately_follows_la_marker() {
             Ok(().into())
         },
     );
-    worker.register_activity("nullres", |_ctx: ActContext, _: String| async { Ok(()) });
+    worker.register_activity("nullres", |_ctx: ActContext| async { Ok(().into()) });
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -755,10 +755,7 @@ async fn test_schedule_to_start_timeout() {
             Ok(().into())
         },
     );
-    worker.register_activity(
-        "echo",
-        move |_ctx: ActContext, _: String| async move { Ok(()) },
-    );
+    worker.register_activity("echo", move |_ctx: ActContext| async move { Ok(().into()) });
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -845,10 +842,7 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
             Ok(().into())
         },
     );
-    worker.register_activity(
-        "echo",
-        move |_ctx: ActContext, _: String| async move { Ok(()) },
-    );
+    worker.register_activity("echo", move |_ctx: ActContext| async move { Ok(().into()) });
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -984,16 +978,13 @@ async fn wft_failure_cancels_running_las() {
             Ok(().into())
         },
     );
-    worker.register_activity(
-        DEFAULT_ACTIVITY_TYPE,
-        move |ctx: ActContext, _: String| async move {
-            let res = tokio::time::timeout(Duration::from_millis(500), ctx.cancelled()).await;
-            if res.is_err() {
-                panic!("Activity must be cancelled!!!!");
-            }
-            Result::<(), _>::Err(ActivityCancelledError::default().into())
-        },
-    );
+    worker.register_activity(DEFAULT_ACTIVITY_TYPE, move |ctx: ActContext| async move {
+        let res = tokio::time::timeout(Duration::from_millis(500), ctx.cancelled()).await;
+        if res.is_err() {
+            panic!("Activity must be cancelled!!!!");
+        }
+        Result::<ActExitValue<()>, _>::Err(ActivityCancelledError::default().into())
+    });
     worker
         .submit_wf(
             wf_id.to_owned(),
@@ -1047,7 +1038,7 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
     );
     worker.register_activity(
         "echo",
-        move |_: ActContext, _: String| async move { Ok(()) },
+        ActivityFunction::from(move |_: ActContext, _: String| async move { Ok(()) }),
     );
     worker
         .submit_wf(
@@ -1106,9 +1097,12 @@ async fn local_act_records_nonfirst_attempts_ok() {
             Ok(().into())
         },
     );
-    worker.register_activity("echo", move |_ctx: ActContext, _: String| async move {
-        Result::<(), _>::Err(anyhow!("I fail"))
-    });
+    worker.register_activity(
+        "echo",
+        ActivityFunction::from(move |_ctx: ActContext, _: String| async move {
+            Result::<(), _>::Err(anyhow!("I fail"))
+        }),
+    );
     worker
         .submit_wf(
             wf_id.to_owned(),

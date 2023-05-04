@@ -573,7 +573,7 @@ async fn slow_completes_with_small_cache() {
         }
         Ok(().into())
     });
-    worker.register_activity("echo_activity", echo);
+    worker.register_activity("echo_activity", ActivityFunction::from(echo));
     for i in 0..20 {
         worker
             .submit_wf(
