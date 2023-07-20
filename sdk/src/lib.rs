@@ -49,6 +49,8 @@ mod activity_context;
 mod app_data;
 pub mod interceptors;
 mod payload_converter;
+pub mod prelude;
+pub mod workflow;
 mod workflow_context;
 mod workflow_future;
 
@@ -64,7 +66,6 @@ use crate::{interceptors::WorkerInterceptor, workflow_context::ChildWfCommon};
 use anyhow::{anyhow, bail, Context};
 use app_data::AppData;
 use futures::{future::BoxFuture, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use serde::Serialize;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
@@ -1010,11 +1011,11 @@ pub trait IntoUpdateValidatorFunc<Arg> {
 }
 impl<A, F> IntoUpdateValidatorFunc<A> for F
 where
-    A: FromJsonPayloadExt + Send,
+    A: FromPayloadExt + Send,
     F: (for<'a> Fn(&'a UpdateInfo, A) -> Result<(), anyhow::Error>) + Send + 'static,
 {
     fn into_update_validator_fn(self) -> BoxUpdateValidatorFn {
-        let wrapper = move |ctx: &UpdateInfo, input: &Payload| match A::from_json_payload(input) {
+        let wrapper = move |ctx: &UpdateInfo, input: &Payload| match A::from_payload(None, input) {
             Ok(deser) => (self)(ctx, deser),
             Err(e) => Err(e.into()),
         };
@@ -1031,15 +1032,16 @@ pub trait IntoUpdateHandlerFunc<Arg, Res> {
 }
 impl<A, F, Rf, R> IntoUpdateHandlerFunc<A, R> for F
 where
-    A: FromJsonPayloadExt + Send,
+    A: FromPayloadExt + Send,
     F: (FnMut(UpdateContext, A) -> Rf) + Send + 'static,
     Rf: Future<Output = Result<R, anyhow::Error>> + Send + 'static,
-    R: AsJsonPayloadExt,
+    R: AsPayloadExt,
 {
     fn into_update_handler_fn(mut self) -> BoxUpdateHandlerFn {
-        let wrapper = move |ctx: UpdateContext, input: &Payload| match A::from_json_payload(input) {
+        let wrapper = move |ctx: UpdateContext, input: &Payload| match A::from_payload(None, input)
+        {
             Ok(deser) => (self)(ctx, deser)
-                .map(|r| r.and_then(|r| r.as_json_payload()))
+                .map(|r| r.and_then(|r| r.as_payload(None)))
                 .boxed(),
             Err(e) => async move { Err(e.into()) }.boxed(),
         };
