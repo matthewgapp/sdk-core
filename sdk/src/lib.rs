@@ -49,6 +49,8 @@ mod activity_context;
 mod app_data;
 pub mod interceptors;
 mod payload_converter;
+pub mod prelude;
+pub mod workflow;
 mod workflow_context;
 mod workflow_future;
 
@@ -64,7 +66,6 @@ use crate::{interceptors::WorkerInterceptor, workflow_context::ChildWfCommon};
 use anyhow::{anyhow, bail, Context};
 use app_data::AppData;
 use futures::{future::BoxFuture, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use serde::Serialize;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
