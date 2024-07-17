@@ -80,6 +80,7 @@ impl WorkflowFunction {
                 sig_chans: Default::default(),
                 updates: Default::default(),
                 update_futures: Default::default(),
+                state: WorkflowFutureState::ProcessingActivations,
             },
             tx,
         )
@@ -122,6 +123,8 @@ pub(crate) struct WorkflowFuture {
     updates: HashMap<String, UpdateFunctions>,
     /// Stores in-progress update futures
     update_futures: Vec<(String, BoxFuture<'static, Result<Payload, Error>>)>,
+    /// Current state of the workflow future. Ensures that activations, their jobs, the inner future and updates are driven forward in order
+    state: WorkflowFutureState,
 }
 
 impl WorkflowFuture {
@@ -142,14 +145,19 @@ impl WorkflowFuture {
         Ok(())
     }
 
-    fn fail_wft(&self, run_id: String, fail: Error) {
+    fn fail_wft(&self, run_id: impl Into<String>, fail: Error) {
+        let run_id = run_id.into();
         warn!("Workflow task failed for {}: {}", run_id, fail);
         self.outgoing_completions
             .send(WorkflowActivationCompletion::fail(run_id, fail.into()))
             .expect("Completion channel intact");
     }
 
-    fn send_completion(&self, run_id: String, activation_cmds: Vec<workflow_command::Variant>) {
+    fn send_completion(
+        &self,
+        run_id: impl Into<String>,
+        activation_cmds: Vec<workflow_command::Variant>,
+    ) {
         self.outgoing_completions
             .send(WorkflowActivationCompletion::from_cmds(
                 run_id,
@@ -301,119 +309,305 @@ impl WorkflowFuture {
     }
 }
 
+/*
+    Workflow futures start processing activations, then drive the inner future, then drive update, then driver the inner again, finally processing activations again.
+    The only way they return Poll::Ready is if they are evicted.
+*/
+
+#[derive(Clone)]
+enum WorkType {
+    // this to also include updates
+    Workflow,
+}
+
+#[derive(Clone)]
+struct ProcessingWork {
+    activation: WorkflowActivation,
+    run_id: String,
+    die_of_eviction_when_done: bool,
+    work_type: WorkType,
+}
+
+#[derive(Clone)]
+enum WorkflowFutureState {
+    ProcessingActivations,
+    ProcessingWorkflow(ProcessingWork),
+    Evicted,
+}
+
 impl Future for WorkflowFuture {
     type Output = WorkflowResult<Payload>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        'activations: loop {
-            // WF must always receive an activation first before responding with commands
-            let activation = match self.incoming_activations.poll_recv(cx) {
-                Poll::Ready(a) => match a {
-                    Some(act) => act,
-                    None => {
-                        return Poll::Ready(Err(anyhow!(
-                            "Workflow future's activation channel was lost!"
-                        )))
-                    }
-                },
+        loop {
+            match self.transition_state(cx) {
                 Poll::Pending => return Poll::Pending,
-            };
-
-            let is_only_eviction = activation.is_only_eviction();
-            let run_id = activation.run_id;
-            {
-                let mut wlock = self.wf_ctx.shared.write();
-                wlock.is_replaying = activation.is_replaying;
-                wlock.wf_time = activation.timestamp.try_into_or_none();
-                wlock.history_length = activation.history_length;
-                wlock.current_build_id = if activation.build_id_for_current_task.is_empty() {
-                    None
-                } else {
-                    Some(activation.build_id_for_current_task)
-                };
-            }
-
-            let mut die_of_eviction_when_done = false;
-            let mut activation_cmds = vec![];
-            // Lame hack to avoid hitting "unregistered" update handlers in a situation where
-            // the history has no commands until an update is accepted. Will go away w/ SDK redesign
-            if activation
-                .jobs
-                .iter()
-                .any(|j| matches!(j.variant, Some(Variant::StartWorkflow(_))))
-                && activation.jobs.iter().all(|j| {
-                    matches!(
-                        j.variant,
-                        Some(Variant::StartWorkflow(_) | Variant::DoUpdate(_))
-                    )
-                })
-            {
-                // Poll the workflow future once to get things registered
-                if self.poll_wf_future(cx, &run_id, &mut activation_cmds)? {
-                    continue;
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(new_state)) => {
+                    self.state = new_state;
+                    if let WorkflowFutureState::Evicted = self.state {
+                        return Ok(WfExitValue::Evicted).into();
+                    }
                 }
             }
+        }
 
-            for WorkflowActivationJob { variant } in activation.jobs {
-                match self.handle_job(variant, &mut activation_cmds) {
-                    Ok(true) => {
-                        die_of_eviction_when_done = true;
-                    }
-                    Err(e) => {
-                        self.fail_wft(run_id, e);
-                        continue 'activations;
-                    }
-                    _ => (),
-                }
-            }
+        // 'activations: loop {
+        //     // WF must always receive an activation first before responding with commands
+        //     println!("at top of loop awaiting activation");
+        //     let activation = match self.incoming_activations.poll_recv(cx) {
+        //         Poll::Ready(a) => match a {
+        //             Some(act) => act,
+        //             None => {
+        //                 return Poll::Ready(Err(anyhow!(
+        //                     "Workflow future's activation channel was lost!"
+        //                 )))
+        //             }
+        //         },
+        //         Poll::Pending => return Poll::Pending,
+        //     };
 
-            if is_only_eviction {
-                // No need to do anything with the workflow code in this case
-                self.outgoing_completions
-                    .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
-                    .expect("Completion channel intact");
-                return Ok(WfExitValue::Evicted).into();
-            }
+        //     println!("activation {:?}", activation);
 
-            // Drive update functions
-            self.update_futures = std::mem::take(&mut self.update_futures)
-                .into_iter()
-                .filter_map(|(instance_id, mut update_fut)| {
-                    match update_fut.poll_unpin(cx) {
-                        Poll::Ready(v) => {
-                            activation_cmds.push(update_response(
-                                instance_id,
-                                match v {
-                                    Ok(v) => update_response::Response::Completed(v),
-                                    Err(e) => update_response::Response::Rejected(e.into()),
-                                },
-                            ));
-                            // Delete if we're done.
-                            None
+        //     let run_id = activation.run_id.as_str();
+
+        //     if activation.is_only_eviction() {
+        //         // No need to do anything with the workflow code in this case
+        //         self.outgoing_completions
+        //             .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
+        //             .expect("Completion channel intact");
+        //         return Ok(WfExitValue::Evicted).into();
+        //     }
+
+        //     {
+        //         let mut wlock = self.wf_ctx.shared.write();
+        //         wlock.is_replaying = activation.is_replaying;
+        //         wlock.wf_time = activation.timestamp.try_into_or_none();
+        //         wlock.history_length = activation.history_length;
+        //         wlock.current_build_id = if activation.build_id_for_current_task.is_empty() {
+        //             None
+        //         } else {
+        //             Some(activation.build_id_for_current_task)
+        //         };
+        //     }
+
+        //     let mut die_of_eviction_when_done = false;
+        //     let mut activation_cmds = vec![];
+        //     // Lame hack to avoid hitting "unregistered" update handlers in a situation where
+        //     // the history has no commands until an update is accepted. Will go away w/ SDK redesign
+        //     if activation
+        //         .jobs
+        //         .iter()
+        //         .any(|j| matches!(j.variant, Some(Variant::StartWorkflow(_))))
+        //         && activation.jobs.iter().all(|j| {
+        //             matches!(
+        //                 j.variant,
+        //                 Some(Variant::StartWorkflow(_) | Variant::DoUpdate(_))
+        //             )
+        //         })
+        //     {
+        //         // Poll the workflow future once to get things registered
+        //         if self.poll_wf_future(cx, run_id, &mut activation_cmds)? {
+        //             continue;
+        //         }
+        //     }
+
+        //     for WorkflowActivationJob { variant } in activation.jobs {
+        //         match self.handle_job(variant, &mut activation_cmds) {
+        //             Ok(true) => {
+        //                 die_of_eviction_when_done = true;
+        //             }
+        //             Err(e) => {
+        //                 self.fail_wft(run_id, e);
+        //                 self.state = WorkflowFutureState::ProcessingActivations;
+        //                 return Poll::Pending;
+        //             }
+        //             _ => (),
+        //         }
+        //     }
+
+        //     // Drive update functions
+        //     self.update_futures = std::mem::take(&mut self.update_futures)
+        //         .into_iter()
+        //         .filter_map(|(instance_id, mut update_fut)| {
+        //             match update_fut.poll_unpin(cx) {
+        //                 Poll::Ready(v) => {
+        //                     activation_cmds.push(update_response(
+        //                         instance_id,
+        //                         match v {
+        //                             Ok(v) => update_response::Response::Completed(v),
+        //                             Err(e) => update_response::Response::Rejected(e.into()),
+        //                         },
+        //                     ));
+        //                     // Delete if we're done.
+        //                     None
+        //                 }
+        //                 Poll::Pending => Some((instance_id, update_fut)),
+        //             }
+        //         })
+        //         .collect();
+
+        //     if self.poll_wf_future(cx, run_id, &mut activation_cmds)? {
+        //         continue;
+        //     }
+
+        //     // TODO: deadlock detector
+        //     // Check if there's nothing to unblock and workflow has not completed.
+        //     // This is different from the assertion that was here before that checked that WF did
+        //     // not produce any commands which is completely viable in the case WF is waiting on
+        //     // multiple completions.
+
+        //     self.send_completion(run_id, activation_cmds);
+
+        //     if die_of_eviction_when_done {
+        //         return Ok(WfExitValue::Evicted).into();
+        //     }
+
+        //     // We don't actually return here, since we could be queried after finishing executing,
+        //     // and it allows us to rely on evictions for death and cache management
+        // }
+    }
+}
+
+impl WorkflowFuture {
+    fn transition_state(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<WorkflowFutureState, anyhow::Error>> {
+        match self.state.clone() {
+            WorkflowFutureState::ProcessingActivations => {
+                let activation = match self.incoming_activations.poll_recv(cx) {
+                    Poll::Ready(a) => match a {
+                        Some(act) => act,
+                        None => {
+                            return Poll::Ready(Err(anyhow!(
+                                "Workflow future's activation channel was lost!"
+                            )))
                         }
-                        Poll::Pending => Some((instance_id, update_fut)),
+                    },
+                    Poll::Pending => return Poll::Pending,
+                };
+
+                println!("activation {:?}", activation);
+
+                let run_id = activation.run_id.to_string();
+
+                if activation.is_only_eviction() {
+                    // No need to do anything with the workflow code in this case
+                    self.outgoing_completions
+                        .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
+                        .expect("Completion channel intact");
+                    return Ok(WorkflowFutureState::Evicted).into();
+                }
+
+                {
+                    let mut wlock = self.wf_ctx.shared.write();
+                    wlock.is_replaying = activation.is_replaying;
+                    wlock.wf_time = activation.timestamp.clone().try_into_or_none();
+                    wlock.history_length = activation.history_length;
+                    wlock.current_build_id = if activation.build_id_for_current_task.is_empty() {
+                        None
+                    } else {
+                        Some(activation.build_id_for_current_task.to_string())
+                    };
+                }
+
+                Poll::Ready(Ok(WorkflowFutureState::ProcessingWorkflow(
+                    ProcessingWork {
+                        activation,
+                        run_id: run_id.to_owned(),
+                        die_of_eviction_when_done: false,
+                        work_type: WorkType::Workflow,
+                    },
+                )))
+            }
+            WorkflowFutureState::ProcessingWorkflow(ProcessingWork {
+                activation,
+                run_id,
+                die_of_eviction_when_done,
+                work_type,
+            }) => {
+                let mut die_of_eviction_when_done = die_of_eviction_when_done;
+                let mut activation_cmds = vec![];
+                // Lame hack to avoid hitting "unregistered" update handlers in a situation where
+                // the history has no commands until an update is accepted. Will go away w/ SDK redesign
+                if activation
+                    .jobs
+                    .iter()
+                    .any(|j| matches!(j.variant, Some(Variant::StartWorkflow(_))))
+                    && activation.jobs.iter().all(|j| {
+                        matches!(
+                            j.variant,
+                            Some(Variant::StartWorkflow(_) | Variant::DoUpdate(_))
+                        )
+                    })
+                {
+                    // Poll the workflow future once to get things registered
+                    if self.poll_wf_future(cx, &run_id, &mut activation_cmds)? {
+                        return Poll::Pending;
                     }
-                })
-                .collect();
+                }
 
-            if self.poll_wf_future(cx, &run_id, &mut activation_cmds)? {
-                continue;
+                for WorkflowActivationJob { variant } in activation.jobs {
+                    match self.handle_job(variant, &mut activation_cmds) {
+                        Ok(true) => {
+                            die_of_eviction_when_done = true;
+                        }
+                        Err(e) => {
+                            self.fail_wft(run_id, e);
+                            self.state = WorkflowFutureState::ProcessingActivations;
+                            return Poll::Pending;
+                        }
+                        _ => (),
+                    }
+                }
+
+                // Drive update functions
+                self.update_futures = std::mem::take(&mut self.update_futures)
+                    .into_iter()
+                    .filter_map(|(instance_id, mut update_fut)| {
+                        match update_fut.poll_unpin(cx) {
+                            Poll::Ready(v) => {
+                                activation_cmds.push(update_response(
+                                    instance_id,
+                                    match v {
+                                        Ok(v) => update_response::Response::Completed(v),
+                                        Err(e) => update_response::Response::Rejected(e.into()),
+                                    },
+                                ));
+                                // Delete if we're done.
+                                None
+                            }
+                            Poll::Pending => Some((instance_id, update_fut)),
+                        }
+                    })
+                    .collect();
+
+                if self.poll_wf_future(cx, &run_id, &mut activation_cmds)? {
+                    return Poll::Pending;
+                }
+
+                // TODO: deadlock detector
+                // Check if there's nothing to unblock and workflow has not completed.
+                // This is different from the assertion that was here before that checked that WF did
+                // not produce any commands which is completely viable in the case WF is waiting on
+                // multiple completions.
+
+                self.send_completion(run_id, activation_cmds);
+
+                if die_of_eviction_when_done {
+                    return Ok(WorkflowFutureState::Evicted).into();
+                } else {
+                    return Ok(WorkflowFutureState::ProcessingActivations).into();
+                }
+
+                // We don't actually return here, since we could be queried after finishing executing,
+                // and it allows us to rely on evictions for death and cache management
             }
 
-            // TODO: deadlock detector
-            // Check if there's nothing to unblock and workflow has not completed.
-            // This is different from the assertion that was here before that checked that WF did
-            // not produce any commands which is completely viable in the case WF is waiting on
-            // multiple completions.
-
-            self.send_completion(run_id, activation_cmds);
-
-            if die_of_eviction_when_done {
-                return Ok(WfExitValue::Evicted).into();
+            WorkflowFutureState::Evicted => {
+                return Poll::Ready(Ok(WorkflowFutureState::Evicted));
             }
-
-            // We don't actually return here, since we could be queried after finishing executing,
-            // and it allows us to rely on evictions for death and cache management
         }
     }
 }
@@ -435,6 +629,7 @@ impl WorkflowFuture {
         {
             Poll::Ready(Err(e)) => {
                 let errmsg = format!("Workflow function panicked: {}", panic_formatter(e));
+                println!("error in workflow future poll {}", errmsg);
                 warn!("{}", errmsg);
                 self.outgoing_completions
                     .send(WorkflowActivationCompletion::fail(
@@ -452,6 +647,7 @@ impl WorkflowFuture {
             Poll::Pending => Poll::Pending,
         };
 
+        println!("waiting for commands");
         while let Ok(cmd) = self.incoming_commands.try_recv() {
             match cmd {
                 RustWfCmd::Cancel(cancellable_id) => {
@@ -573,6 +769,7 @@ impl WorkflowFuture {
                     self.sig_chans.insert(signame, SigChanOrBuffer::Chan(chan));
                 }
                 RustWfCmd::ForceWFTFailure(err) => {
+                    println!("force failure");
                     self.fail_wft(run_id.to_string(), err);
                     return Ok(true);
                 }
