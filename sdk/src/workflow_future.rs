@@ -544,7 +544,7 @@ impl WorkflowFuture {
                 {
                     // Poll the workflow future once to get things registered
                     if self.poll_wf_future(cx, &run_id, &mut activation_cmds)? {
-                        return Poll::Pending;
+                        return Poll::Ready(Ok(WorkflowFutureState::ProcessingActivations));
                     }
                 }
 
@@ -555,8 +555,7 @@ impl WorkflowFuture {
                         }
                         Err(e) => {
                             self.fail_wft(run_id, e);
-                            self.state = WorkflowFutureState::ProcessingActivations;
-                            return Poll::Pending;
+                            return Poll::Ready(Ok(WorkflowFutureState::ProcessingActivations));
                         }
                         _ => (),
                     }
@@ -584,7 +583,7 @@ impl WorkflowFuture {
                     .collect();
 
                 if self.poll_wf_future(cx, &run_id, &mut activation_cmds)? {
-                    return Poll::Pending;
+                    return Poll::Ready(Ok(WorkflowFutureState::ProcessingActivations));
                 }
 
                 // TODO: deadlock detector
@@ -596,18 +595,16 @@ impl WorkflowFuture {
                 self.send_completion(run_id, activation_cmds);
 
                 if die_of_eviction_when_done {
-                    return Ok(WorkflowFutureState::Evicted).into();
+                    Ok(WorkflowFutureState::Evicted).into()
                 } else {
-                    return Ok(WorkflowFutureState::ProcessingActivations).into();
+                    Ok(WorkflowFutureState::ProcessingActivations).into()
                 }
 
                 // We don't actually return here, since we could be queried after finishing executing,
                 // and it allows us to rely on evictions for death and cache management
             }
 
-            WorkflowFutureState::Evicted => {
-                return Poll::Ready(Ok(WorkflowFutureState::Evicted));
-            }
+            WorkflowFutureState::Evicted => Poll::Ready(Ok(WorkflowFutureState::Evicted)),
         }
     }
 }
@@ -615,7 +612,7 @@ impl WorkflowFuture {
 // Separate impl block down here just to keep it close to the future poll implementation which
 // it is specific to.
 impl WorkflowFuture {
-    /// Returns true if the workflow future polling loop should be continued
+    /// Returns true if the workflow should transition to activation processing
     fn poll_wf_future(
         &mut self,
         cx: &mut Context,
